@@ -1,33 +1,23 @@
+# Preliminary check for systems in systems.csv, will create plots of all the available
+# lightcurves. You can then choose to either use all available lightcurves or make a list
+# that picks out the ones that you want in the main script.
+# Python 3.8.2
 import lightkurve as lk
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import math
 import os
-import warnings  # Import warnings
 
-# --- Configuration ---
 csv_filename = "systems.csv"
 output_plot_dir = "sector_lightcurve_plots"
 os.makedirs(output_plot_dir, exist_ok=True)
 
-# --- Read System Names ---
-try:
-    data = pd.read_csv(csv_filename, comment="#")
-    if "system_name" not in data.columns:
-        raise ValueError(
-            f"CSV file '{csv_filename}' must contain a column named 'system_name'"
-        )
-    system_names = data["system_name"].dropna().unique().tolist()
-    print(f"Found {len(system_names)} unique system names in {csv_filename}")
-except FileNotFoundError:
-    print(f"Error: CSV file '{csv_filename}' not found.")
-    exit()
-except Exception as e:
-    print(f"Error reading CSV file: {e}")
-    exit()
+# Read System Names
+data = pd.read_csv(csv_filename, comment="#")
+system_names = data["system_name"].dropna().unique().tolist()
 
-# --- Loop Through Systems ---
+# Loop Through Systems
 for system_name in system_names:
     print(f"\nProcessing: {system_name}")
     try:
@@ -85,7 +75,7 @@ for system_name in system_names:
         )
         axes = axes.flat
 
-        # Iterate through EACH VALID light curve
+        # Iterate through light curve
         plot_count = 0
         processed_lcs_info = []
         for i, lc_raw in enumerate(valid_lcs_for_plotting):
@@ -96,14 +86,12 @@ for system_name in system_names:
 
             print(f"    Processing {label}...")
             try:
-                # Process this individual LC (Order: NaN -> Outlier -> Normalize)
+                # Process this individual LC
                 lc_step1 = lc_raw.remove_nans()
                 if lc_step1 is None or len(lc_step1.time) == 0:
                     continue
                 try:
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        lc_step2 = lc_step1.remove_outliers(sigma=5)
+                    lc_step2 = lc_step1.remove_outliers(sigma=5)
                     if lc_step2 is None or len(lc_step2.time) == 0:
                         lc_step2 = lc_step1  # Fallback
                 except Exception:
@@ -113,9 +101,6 @@ for system_name in system_names:
                 if lc_processed is None or len(lc_processed.time) == 0:
                     continue
 
-                # =======================================================
-                # EXPLICIT CONVERSION TO NUMPY & SANITIZATION
-                # =======================================================
                 time_val = lc_processed.time.value
                 flux_val = lc_processed.flux.value
                 # Check for flux_err existence before accessing .value
@@ -134,7 +119,7 @@ for system_name in system_names:
                 f = np.asarray(flux_val)
                 ferr = np.asarray(flux_err_val)
 
-                # Ensure consistent lengths (should be handled by lightkurve, but safe)
+                # Ensure consistent lengths (should be handled by lightkurve)
                 min_len = min(len(t), len(f), len(ferr))
                 t, f, ferr = t[:min_len], f[:min_len], ferr[:min_len]
 
@@ -144,15 +129,12 @@ for system_name in system_names:
                 f = f[finite_data_mask]
                 ferr = ferr[finite_data_mask]
 
-                # Handle error array: Replace non-finite or non-positive errors with NaN
-                # This operation works safely on standard NumPy arrays
                 invalid_err_mask = ~np.isfinite(ferr) | (ferr <= 0)
                 ferr[invalid_err_mask] = np.nan
-                # =======================================================
 
                 if len(t) < 10:
                     print(
-                        f"      Skipping: Too few valid/finite points after final processing."
+                        "      Skipping: Too few valid/finite points after final processing."
                     )
                     continue
 
@@ -164,7 +146,7 @@ for system_name in system_names:
                     ax.errorbar(
                         t,
                         f,
-                        yerr=ferr,  # Pass the sanitized ferr array
+                        yerr=ferr,
                         fmt=".",
                         markersize=2,
                         alpha=0.6,
@@ -191,9 +173,7 @@ for system_name in system_names:
                     break
 
             except Exception as e_proc:
-                print(f"      *** ERROR processing individual LC {label}: {e_proc} ***")
-                # import traceback # Uncomment for detailed debugging if needed
-                # traceback.print_exc()
+                print(f"Error processing individual LC {label}: {e_proc}")
                 continue
 
         # Clean up unused axes
@@ -203,7 +183,6 @@ for system_name in system_names:
         # Add overall figure title and adjust layout
         if plot_count > 0:
             fig.suptitle(f"Individual Sector Light Curves: {system_name}", fontsize=16)
-            # constrained_layout=True should handle spacing
 
             # Save the combined figure
             plot_filename = os.path.join(output_plot_dir, f"sectors_{system_name}.png")
@@ -215,8 +194,6 @@ for system_name in system_names:
         plt.close(fig)
 
     except Exception as e:
-        print(f"  *** ERROR processing system {system_name}: {e} ***")
+        print(f"Error processing system {system_name}: {e}")
         plt.close("all")
         continue
-
-print("\nPreliminary check complete.")
