@@ -26,8 +26,14 @@ pip install juliet ldtk pandas brokenaxes
 ```
 
 ### To-do
+<<<<<<< HEAD
 
 - Could implement RV fits as well, ```juliet``` has RV + Transit fit capabilities, if there is a want for using other instruments besides TESS
 - ```juliet``` lets you combine data from multiple instruments, and *I think* that each TESS mission needs to have its own instrument parameters, if not every separate observation. I only think this is the case because data from later mission just *looks* different, and in the RV examples they have separate instrument parameters for the same telescope, but I cannot find anything in the docs that explicitly mentions this. There is some backbone in the script to do this, but the fits were not successful, so I resorted to treating every observation as one. Again, not sure how important this is. See juliet docs for more information.
+=======
+- Could implement RV fits as well, ```juliet``` has RV + Transit fit capabilities.
+- Need to get fits to converge while assigning each observation as its own "instrument".
+  - ```juliet``` lets you combine data from multiple instruments, and *I think* that each TESS mission needs to have its own instrument parameters, if not every separate observation. This is obvious when looking at data that was taken during different missions. There is some backbone in the script to do this, but the fits were not successful, so I resorted to treating every observation as one. See ```juliet``` docs for more information.
+>>>>>>> origin
 - Add in some simple sinusoidal function fitting capability for the O-C plot. ```scipy``` could be used for this.
 - There are other packages that could be used, ```exoplanet``` being the main one. This might be more robust, could be looked into.
