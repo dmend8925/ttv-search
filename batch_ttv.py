@@ -2,23 +2,24 @@
 # Python 3.8.2
 # TODO:
 # Assign each observation its own instrument parameters and make this work with fitting
-# Need to add in radial velocity considerations, juliet docs have more info for RV + Transit fits
-import lightkurve as lk
-import pickle
-import os
-import matplotlib.gridspec as gridspec
-import numpy as np
-import matplotlib.pyplot as plt
 import argparse
-import juliet
-import pandas as pd
-import astropy.units as u
-from ldtk import LDPSetCreator
-from ldtk.filters import tess
+import os
+from os.path import split
+import pickle
 from pathlib import Path
-from scipy import stats
+
+import astropy.units as u
+import juliet
+import lightkurve as lk
+import matplotlib.gridspec as gridspec
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 from astropy.timeseries import BoxLeastSquares
 from brokenaxes import brokenaxes
+from ldtk import LDPSetCreator
+from ldtk.filters import tess
+from scipy import stats
 
 
 # Whether or not to do the TTV fit
@@ -34,6 +35,22 @@ def parse_args():
 
 
 args = parse_args()
+
+
+# Set n_live_points based on free parameters
+def calc_dimensions(priors, key="distribution", distribution="fixed"):
+    dimensions = 0
+    if isinstance(priors, dict):
+        for k, v in priors.items():
+            if k == key and v != distribution:
+                dimensions += 1
+            dimensions += calc_dimensions(v)
+    return dimensions
+
+
+def calc_n_live_points(dimensions):
+    return int(np.ceil((dimensions**2) / 100)) * 100
+
 
 # Read Full CSV
 all_data = pd.read_csv("systems.csv", comment="#")
@@ -83,6 +100,7 @@ for system_name in system_names:
     result_dir.mkdir(exist_ok=True)
 
     # Calculate LDCs (needs to be inside loop as it depends on stellar params)
+    print(f"Calculating LDCs for {system_name}...")
     sc = LDPSetCreator(
         teff=(teff, 100), logg=(logg, 0.2), z=(feh, 0.05), filters=[tess]
     )
@@ -91,8 +109,9 @@ for system_name in system_names:
 
     qc, qe = ps.coeffs_qd(do_mc=True, n_mc_samples=10000)
     q1, q2 = qc[0][0], qc[0][1]
-    # q1_err, q2_err = qe[0][0], qe[0][1] # Errors not used in fixed priors
+    # q1err, q2err = qe[0][0], qe[0][1]  # Errors not used in fixed priors
 
+    print(f"Getting lightcurves for {system_name}...")
     # Fetch and prepare data
     search_result = lk.search_lightcurve(system_name, mission="TESS", author="SPOC")
 
@@ -100,27 +119,22 @@ for system_name in system_names:
     # lc_collection_raw = [search_result.download()[5],search_result.download()[6]]
     lc_collection_raw = search_result.download_all()
 
-    # Dictinaries for the times and fluxes, maybe not the best way to initilize these but oh well
-    times, fluxes, fluxes_error = (
-        {"TESS": np.asarray(None)},
-        {"TESS": np.asarray(None)},
-        {"TESS": np.asarray(None)},
-    )
     instrument_names = []  # To store names like TESS_SEC01
-    all_t_for_estimate, all_f_for_estimate, all_ferr_for_estimate = (
-        [],
-        [],
-        [],
-    )
-    print(f"Getting lightcurves for {system_name}...")
+    t_list, f_list, ferr_list = [], [], []
+
     for lc_individual in lc_collection_raw:
-        # It MAY be (read:it definitely is) necessary to save each sector as an
+        # It MAY be necessary to save each sector as an
         # 'instrumnet' and have its own parameters but for now I can't get it to
-        # work this way, so it is all one instrument
+        # work this way, so it is all one instrument. Binning might fix this.
         # sector = lc_individual.meta.get("SECTOR", "UNKNOWN")
         instrument_name = "TESS"  # Create instrument name
 
-        lc_processed = lc_individual.normalize().remove_nans().remove_outliers(sigma=5)
+        lc_processed = (
+            lc_individual.normalize().remove_nans().remove_outliers(sigma=5)
+            # .bin(5 / 1440)
+        )
+        # binning might help reduce run time, but not recommended
+
         if lc_processed is None or len(lc_processed.time) == 0:
             continue
 
@@ -152,43 +166,37 @@ for system_name in system_names:
         if len(t_inst) < 10:
             continue  # Skip if too few points remain
 
-        # Store in dictionaries for juliet
-        times["TESS"] = np.append(times["TESS"], t_inst)
-        fluxes["TESS"] = np.append(fluxes["TESS"], f_inst)
-        fluxes_error["TESS"] = np.append(fluxes_error["TESS"], ferr_inst)
+        # Store in list for now
+        t_list.extend(t_inst)
+        f_list.extend(f_inst)
+        ferr_list.extend(ferr_inst)
 
         # Prepare data for concatenation (handle errors for BLS)
-        all_t_for_estimate.append(t_inst)
-        all_f_for_estimate.append(f_inst)
-        median_err = np.nanmedian(
-            ferr_inst[np.isfinite(ferr_inst) & (ferr_inst > 0)]
-        )  # Calculate median from valid errors
+        # median_err = np.nanmedian(
+        #     ferr_inst[np.isfinite(ferr_inst) & (ferr_inst > 0)]
+        # )  # Calculate median from valid errors, not sure I need this
 
-        if np.isnan(median_err) or median_err <= 0:
-            median_err = 1.0  # Absolute fallback
-        ferr_bls = np.copy(ferr_inst)  # Make a copy for BLS
-        invalid_err_mask_bls = ~np.isfinite(ferr_bls) | (ferr_bls <= 0)
-        ferr_bls[invalid_err_mask_bls] = (
-            median_err  # Replace invalid with median for BLS
-        )
-        all_ferr_for_estimate.append(ferr_bls)
+        # if np.isnan(median_err) or median_err <= 0:
+        #     median_err = 1.0  # Absolute fallback
+        # ferr_bls = np.copy(ferr_inst)  # Make a copy for BLS
+        # invalid_err_mask_bls = ~np.isfinite(ferr_bls) | (ferr_bls <= 0)
+        # ferr_bls[invalid_err_mask_bls] = (
+        #     median_err  # Replace invalid with median for BLS
+        # )
+        # all_ferr_for_estimate.append(ferr_bls)
 
-    # Concatenate for estimation steps
-    times["TESS"] = np.delete(times["TESS"], 0)
-    fluxes["TESS"] = np.delete(fluxes["TESS"], 0)
-    fluxes_error["TESS"] = np.delete(fluxes_error["TESS"], 0)
-    t_concat = np.concatenate(all_t_for_estimate)
-    f_concat = np.concatenate(all_f_for_estimate)
-    ferr_concat = np.concatenate(all_ferr_for_estimate)  # This is ferr_bls combined
-    sort_idx = np.argsort(t_concat)
+    # Create and sort arrays
+    t = np.array(t_list)
+    f = np.array(f_list)
+    ferr = np.array(ferr_list)
 
-    # Overwrite t, f, ferr with concatenated versions FOR ESTIMATION ONLY
-    t = t_concat[sort_idx]
-    f = f_concat[sort_idx]
-    ferr = ferr_concat[sort_idx]  # Use this ferr for BLS
+    sort_idx = np.argsort(t)
+    t_sorted = t[sort_idx]
+    f_sorted = f[sort_idx]
+    ferr_sorted = ferr[sort_idx]  # Original errors, sorted
 
     # Detect gaps and create segments
-    gap_threshold = 7.0
+    gap_threshold = 7.0  # gaps >7 days will be removed AFFECTS ONLY THE PLOTTING
     buffer = 0.5
     dt = np.diff(t)
     gap_indices = np.where(dt > gap_threshold)[0]
@@ -231,8 +239,8 @@ for system_name in system_names:
     )
     plt.close()
 
-    print(f"Estimating t0 for {system_name}...")
     # Estimate t0
+    print(f"Calculating t0 for {system_name}")
     period_search_min = P * 0.99  # Using P from CSV
     period_search_max = P * 1.01
 
@@ -401,6 +409,10 @@ for system_name in system_names:
     plt.close()
 
     # Populate priors
+    times = {"TESS": t_sorted}
+    fluxes = {"TESS": f_sorted}
+    fluxes_error = {"TESS": ferr_sorted}
+
     print(f"No TTV fit for {system_name}...")
     priors = {
         "P_p1": {"distribution": "normal", "hyperparameters": [P_bls, 0.1]},
@@ -408,14 +420,15 @@ for system_name in system_names:
             "distribution": "normal",
             "hyperparameters": [t0_estimate_final, 0.1],
         },
-        "p_p1": {"distribution": "normal", "hyperparameters": [p, 0.1]},
+        "p_p1": {"distribution": "normal", "hyperparameters": [p, 1]},
         "b_p1": {"distribution": "truncatedNormal", "hyperparameters": [b, 0.1, 0, 1]},
-        "a_p1": {"distribution": "uniform", "hyperparameters": [a - 0.5, a + 0.5]},
+        "a_p1": {"distribution": "normal", "hyperparameters": [a, 1]},
         "q1_TESS": {"distribution": "fixed", "hyperparameters": q1},
         "q2_TESS": {"distribution": "fixed", "hyperparameters": q2},
-        "ecc_p1": {"distribution": "fixed", "hyperparameters": 0.0},
+        "ecc_p1": {"distribution": "fixed", "hyperparameters": 0},
         "omega_p1": {"distribution": "fixed", "hyperparameters": 90.0},
     }
+
     # could replace some params with parameterizations, see juliet docs
     # Instrument-specific parameters
     for instrument in ["TESS"]:  # replace 'TESS' with instrument_names
@@ -431,7 +444,37 @@ for system_name in system_names:
             "distribution": "loguniform",
             "hyperparameters": [0.1, 10000.0],
         }
-
+        # Priors for GP processes
+        # use these or the GP params below, having both might be excesssive
+        # BUT I CAN'T GET IT TO WORK WITH JUST WITHOUT THE MATERN KERNEL
+        # oh well I guess it's fine
+        # use these if lightcurves show a lot of stellar variablity
+        # use Matern kernel for other correlated noise
+        priors["GP_B"] = {
+            "distribution": "loguniform",
+            "hyperparameters": [1e-6, 1e-1],
+        }
+        priors["GP_C"] = {
+            "distribution": "loguniform",
+            "hyperparameters": [0.01, 100],
+        }
+        priors["GP_L"] = {
+            "distribution": "loguniform",
+            "hyperparameters": [0.1, 100.0],
+        }
+        priors["GP_Prot"] = {
+            "distribution": "loguniform",
+            "hyperparameters": [2, 100],
+        }
+        # These are the Matern kernel params, always have these
+        priors[f"GP_sigma_{instrument}"] = {
+            "distribution": "loguniform",
+            "hyperparameters": [1e-6, 1e6],
+        }
+        priors[f"GP_rho_{instrument}"] = {
+            "distribution": "loguniform",
+            "hyperparameters": [1e-3, 1e3],
+        }
     # Initial Fit (No TTV)
     out_folder_no_ttv = f"{result_path}/{system_name}_noTTV"
     dataset_no_ttv = juliet.load(
@@ -439,40 +482,50 @@ for system_name in system_names:
         t_lc=times,
         y_lc=fluxes,
         yerr_lc=fluxes_error,
+        GP_regressors_lc=times,
+        verbose=True,
         out_folder=out_folder_no_ttv,
     )
 
-    # 500 live points good for one planet models, increase if fitting for more planets or if using
-    # muliple instruments
-    results_no_ttv = dataset_no_ttv.fit(
-        sampler="multinest", use_MPI=True, n_live_points=500
-    )
+    # Dynamically assinging n_live_points (wow)
+    live_points = calc_n_live_points(calc_dimensions(priors))
+    # I don't know which one is faster, I can't get mulitthreading to work with multinest so maybe
+    # dynesty is better
+
     # results_no_ttv = dataset_no_ttv.fit(
-    #    sampler="dynesty", nthreads=8, n_live_points=500
+    #    sampler="multinest", use_MPI=True, n_live_points=1000
     # )
+    print(f"{calc_dimensions(priors)} free parameters")
+    results_no_ttv = dataset_no_ttv.fit(
+        sampler="dynesty", nthreads=4, n_live_points=live_points
+    )
 
-    # Extract Likelihood (TTV) - with dynesty
-    # raw_results_file_no_ttv = os.path.join(
-    #    out_folder_no_ttv, "_dynesty_NS_posteriors.pkl"
-    # )
+    # Extract Likelihood - with dynesty
+    raw_results_file_no_ttv = os.path.join(
+        out_folder_no_ttv, "_dynesty_NS_posteriors.pkl"
+    )
 
-    # dynesty_results_no_ttv = pickle.load(open(raw_results_file_no_ttv, "rb"))
+    dynesty_results_no_ttv = pickle.load(open(raw_results_file_no_ttv, "rb"))
 
-    # like_no_ttv, like_no_ttv_err = (
-    #    dynesty_results_no_ttv["lnZ"],
-    #    dynesty_results_no_ttv["lnZerr"],
-    # )
+    like_no_ttv, like_no_ttv_err = (
+        dynesty_results_no_ttv["lnZ"],
+        dynesty_results_no_ttv["lnZerr"],
+    )
 
     # Extract Likelihood (TTV) - with mulitnest
-    like_no_ttv, like_no_ttv_err = (
-        results_no_ttv.posteriors["lnZ"],
-        results_no_ttv.posteriors["lnZerr"],
-    )
+    # like_no_ttv, like_no_ttv_err = (
+    #    results_no_ttv.posteriors["lnZ"],
+    #    results_no_ttv.posteriors["lnZerr"],
+    # )
 
-    # Extract median model and the ones that cover the 68% credibility band around it:
-    transit_model, transit_up68, transit_low68 = results_no_ttv.lc.evaluate(
-        "TESS", return_err=True
-    )
+    # Extract full model (transit + GP)
+    transit_plus_GP_model = results_no_ttv.lc.evaluate("TESS")
+
+    # Transit model
+    transit_model = results_no_ttv.lc.model["TESS"]["deterministic"]
+
+    # GP model
+    gp_model = results_no_ttv.lc.model["TESS"]["GP"]
 
     # To plot the phased lighcurve we need the median period and time-of-transit center:
     P, t0 = (
@@ -507,7 +560,9 @@ for system_name in system_names:
     time_segments = np.split(time, split_indices)
     data_segments = np.split(dataset_no_ttv.data_lc["TESS"], split_indices)
     error_segments = np.split(dataset_no_ttv.errors_lc["TESS"], split_indices)
-    model_segments = np.split(transit_model, split_indices)
+    model_segments = np.split(transit_plus_GP_model, split_indices)
+    transit_model_segments = np.split(transit_model, split_indices)
+    gp_model_segments = np.split(gp_model, split_indices)
 
     # Create xlims with buffer
     xlims = [
@@ -544,23 +599,15 @@ for system_name in system_names:
     ax2 = plt.subplot(gs[1])
     ax2.errorbar(
         phases,
-        dataset_no_ttv.data_lc["TESS"],
+        dataset_no_ttv.data_lc["TESS"] - gp_model,
         yerr=dataset_no_ttv.errors_lc["TESS"],
         fmt=".",
         alpha=0.3,
     )
     idx = np.argsort(phases)
     ax2.plot(phases[idx], transit_model[idx], color="black", zorder=10)
-    ax2.fill_between(
-        phases[idx],
-        transit_up68[idx],
-        transit_low68[idx],
-        color="white",
-        alpha=0.5,
-        zorder=5,
-    )
     ax2.set_xlabel("Phases")
-    ax2.set_xlim([-0.03, 0.03])
+    ax2.set_xlim([-0.5, 0.5])
     ax2.set_ylim([0.98, 1.02])
 
     ax1.set_title(f"{system_name} - No TTV Fit")
@@ -574,6 +621,7 @@ for system_name in system_names:
     if not args.do_ttv:
         continue
 
+    print(f"TTV fit for {system_name}...")
     # Checking for transit at expected times
     valid_transits = []
     time_min, time_max = np.min(t), np.max(t)
@@ -586,7 +634,7 @@ for system_name in system_names:
     expected_times = t0 + transit_numbers * P
 
     window = transit_duration_bls * 1.2  # Using BLS duration for window
-    min_points_for_ttv = 20  # Original value
+    min_points_for_ttv = 5
     for n, t_pred in zip(transit_numbers, expected_times):
         instrument_found = None
         # Check EACH instrument stored in the 'times' dictionary
@@ -622,6 +670,57 @@ for system_name in system_names:
 
         priors_ttv.update(transit_priors)  # Update priors dictionary once
 
+        # Plot Expected Transits
+        valid_times = []
+        valid_numbers = []
+        for vt in valid_transits:
+            valid_times.append(vt["expected_time"])
+            valid_numbers.append(vt["transit_number"])
+
+        plt.figure(figsize=(12, 6))
+        bax = brokenaxes(xlims=xlims, hspace=0.1, despine=False, diag_color="none")
+
+        # Plot light curve with existing data
+        bax.errorbar(t, f, fmt=".", alpha=0.3, label="Light Curve")
+
+        window_plot = 0.1
+        min_flux_plot = np.percentile(f, 1) if len(f) > 0 else 0.95
+
+        # Plot transit markers and lines
+        for t_pred in valid_times:
+            mask_plot = (t >= t_pred - window_plot) & (t <= t_pred + window_plot)
+            bax.plot(t[mask_plot], f[mask_plot], "ro", alpha=0.7, markersize=5)
+
+            bax.axvline(t_pred, color="k", ls="--", alpha=0.5)
+
+        for n, t_pred in zip(valid_numbers, valid_times):
+            for ax in bax.axs:
+                xmin, xmax = ax.get_xlim()
+                if xmin <= t_pred <= xmax:
+                    ax.text(
+                        t_pred,
+                        min_flux_plot - 0.01,
+                        f"N={transit_numbers[n]}",
+                        ha="center",
+                        va="top",
+                        rotation=90,
+                        fontsize=4,
+                    )
+                    break
+
+        # Formatting
+        bax.set_xlabel(f"Time ({lc_processed.time.format.upper()})")
+        bax.set_ylabel("Normalized Flux")
+        bax.set_title(f"Light Curve with Expected Transits: {system_name}")
+        bax.legend(loc="upper right")
+
+        plt.savefig(
+            f"{result_path}/check_transits_{system_name}.png",
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close()
+
         # Fit with TTVs
         out_folder_ttv = f"{result_path}/{system_name}_ttv"  # Unique folder
         dataset_ttv = juliet.load(
@@ -629,44 +728,47 @@ for system_name in system_names:
             t_lc=times,
             y_lc=fluxes,
             yerr_lc=fluxes_error,
+            GP_regressors_lc=times,
             out_folder=out_folder_ttv,
         )
-        # 1000 live points good for around 30 transits found
-        print(f"TTV fit for {system_name}...")
 
-        # results_ttv = dataset_ttv.fit(sampler="dynesty", nthreads=8, n_live_points=1000)
+        live_points_ttv = calc_n_live_points(calc_dimensions(priors_ttv))
         results_ttv = dataset_ttv.fit(
-            sampler="multinest", use_MPI=True, n_live_points=1000
+            sampler="dynesty", nthreads=4, n_live_points=live_points_ttv
         )
+        # results_ttv = dataset_ttv.fit(
+        #    sampler="multinest", use_MPI=True, n_live_points=100000
+        # )
 
         # Extract Likelihood (TTV)
-        # raw_results_file_ttv = os.path.join(
-        #    out_folder_ttv, "_dynesty_NS_posteriors.pkl"
-        # )
+        raw_results_file_ttv = os.path.join(
+            out_folder_ttv, "_dynesty_NS_posteriors.pkl"
+        )
 
-        # dynesty_results_ttv = pickle.load(open(raw_results_file_ttv, "rb"))
+        dynesty_results_ttv = pickle.load(open(raw_results_file_ttv, "rb"))
+
+        like_ttv, like_ttv_err = (
+            dynesty_results_ttv["lnZ"],
+            dynesty_results_ttv["lnZerr"],
+        )
 
         # like_ttv, like_ttv_err = (
-        #    dynesty_results_ttv["lnZ"],
-        #    dynesty_results_ttv["lnZerr"],
+        #    results_ttv.posteriors["lnZ"],
+        #    results_ttv.posteriors["lnZerr"],
         # )
-        like_ttv, like_ttv_err = (
-            results_ttv.posteriors["lnZ"],
-            results_ttv.posteriors["lnZerr"],
-        )
 
         # Plot TTV fit results
-        transit_model_ttv = results_ttv.lc.evaluate("TESS")  # Still assumes TESS
-        fig = plt.figure(figsize=(12, 4))
+        # Full model
+        transit_plus_GP_ttv = results_ttv.lc.evaluate("TESS")  # Still assumes TESS
 
-        # Plot the data
-        plt.errorbar(
-            dataset_ttv.times_lc["TESS"],
-            dataset_ttv.data_lc["TESS"],
-            yerr=dataset_ttv.errors_lc["TESS"],
-            fmt=".",
-            alpha=0.1,
-        )
+        # Transit model
+        # shouldn't need to extract these if not plotting phases
+        # transit_model_ttv = results_ttv.lc.model["TESS"]["deterministic"]
+
+        # GP model
+        # gp_model_ttv = results_ttv.lc.model["GP"]
+
+        fig = plt.figure(figsize=(12, 4))
 
         # Plot the model
         time = dataset_ttv.times_lc["TESS"]
@@ -675,7 +777,9 @@ for system_name in system_names:
         time_segments = np.split(time, split_indices)
         data_segments = np.split(dataset_ttv.data_lc["TESS"], split_indices)
         error_segments = np.split(dataset_ttv.errors_lc["TESS"], split_indices)
-        model_segments = np.split(transit_model_ttv, split_indices)
+        model_segments = np.split(transit_plus_GP_ttv, split_indices)
+        # transit_model_segments = np.split(transit_model_ttv, split_indices)
+        # gp_model_segments = np.split(gp_model_ttv, split_indices)
 
         xlims = [
             (seg[0] - buffer, seg[-1] + buffer) for seg in time_segments if len(seg) > 0
@@ -693,7 +797,9 @@ for system_name in system_names:
             time_segments, data_segments, error_segments, model_segments
         ):
             if len(t_seg) > 0:
-                bax.errorbar(t_seg, d_seg, yerr=e_seg, fmt=".", alpha=0.1)
+                bax.errorbar(
+                    t_seg, d_seg, yerr=e_seg, color="dodgerblue", fmt=".", alpha=0.1
+                )
                 bax.plot(t_seg, m_seg, color="black", zorder=10)
 
         # Format broken axes
@@ -709,49 +815,6 @@ for system_name in system_names:
             bbox_inches="tight",
         )
         plt.close(fig)
-
-        # Plot Expected Transits
-        try:
-            plt.figure(figsize=(12, 6))
-            plt.errorbar(t, f, fmt=".", alpha=0.3, label="Light Curve")  # Use t, f
-            window_plot = 0.1
-            min_flux_plot = np.percentile(f, 1) if len(f) > 0 else 0.95
-            for t_pred in valid_transits[
-                "expected_time"
-            ]:  # expected_times based on t0_valid, P_valid
-                mask_plot = (t >= t_pred - window_plot) & (t <= t_pred + window_plot)
-                plt.plot(t[mask_plot], f[mask_plot], "ro", alpha=0.7, markersize=5)
-            for n, t_pred in (
-                range(len(valid_transits)),
-                valid_transits["expected_time"],
-            ):
-                plt.axvline(t_pred, color="k", ls="--", alpha=0.5)
-                # Use transit_numbers array for correct label numbering
-                if n < len(transit_numbers):
-                    plt.text(
-                        t_pred,
-                        min_flux_plot - 0.01,
-                        f"N={transit_numbers[n]}",
-                        ha="center",
-                        va="top",
-                        rotation=90,
-                        fontsize=8,
-                    )
-            plt.xlabel(
-                f"Time ({lc_processed.time.format.upper()})"
-            )  # Use correct lc object
-            plt.ylabel("Normalized Flux")
-            plt.title(f"Light Curve with Expected Transits: {system_name}")
-            plt.legend()
-            plt.savefig(
-                f"{result_path}/check_ttv_for_{system_name}.png",
-                dpi=300,
-                bbox_inches="tight",
-            )
-            plt.close()
-        except Exception:
-            plt.close("all")
-            pass
 
         # O-C plot
         try:
@@ -829,7 +892,9 @@ for system_name in system_names:
         except Exception:
             plt.close("all")
             pass
-
+    else:
+        print(f"No valid transits for {system_name}...")
+        like_ttv, like_ttv_err = 0, 0
     # Save likelihoods
     delta_logZ = like_ttv - like_no_ttv
     likelihoods = {
